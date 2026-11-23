@@ -1,0 +1,11 @@
+[Unit]
+Description=nvidia-sidecar: nvidia-persistenced for the legacy GPUs only (keeps them initialized; power limits hold)
+# 'nvidia-sidecar up' adds the BindPaths= drop-in (one per legacy GPU) in /run/systemd/system/<this>.d/binds.conf
+ConditionPathExists=/dev/nvidia-@SUFFIX@/nvidiactl
+
+[Service]
+Type=forking
+# its own runtime folder: the open driver's nvidia-persistenced owns /run/nvidia-persistenced
+RuntimeDirectory=nvidia-persistenced-@SUFFIX@
+BindPaths=/run/nvidia-persistenced-@SUFFIX@:/run/nvidia-persistenced
+ExecStart=/usr/bin/nvidia-persistenced --verbose

@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Make two NVIDIA drivers look like one nvidia-smi inventory.
+
+The wrapper runs NVIDIA's real binary once against each driver, then stitches the results back together. Open-driver
+GPUs come first and sidecar GPUs keep counting from there. Selectors such as `-i N` go only to the driver that owns
+that merged index. If the sidecar is down or the caller already chose one side, this gets out of the way completely;
+`NVIDIA_SMI_NO_MERGE=1` also bypasses it explicitly.
+"""
+import os
+import itertools
+import re
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REAL = os.environ.get("NVIDIA_SMI_REAL", "/usr/bin/nvidia-smi")
+REDIRECT = os.environ.get("NVIDIA_SIDECAR_REDIRECT") or os.path.join(HERE, "libnvidia-sidecar-redirect.so")
+try:   # nvidia-smi needs the real NVML recorded by the build, never the merged proxy.
+    REAL_NVML = open(os.path.join(HERE, ".real")).read().split()[1]
+except (OSError, IndexError):
+    REAL_NVML = ""
+SUFFIX = os.environ.get("NVIDIA_SIDECAR_SUFFIX") or "sidecar"
+HOST, LEG = 0, 1
+
+
+def passthrough(args):
+    env = dict(os.environ)
+    if REAL_NVML:
+        env["LD_PRELOAD"] = REAL_NVML + (" " + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    os.execve(REAL, [REAL] + args, env)
+
+
+def side_env(side):
+    env = dict(os.environ)
+    pre = [REAL_NVML] if REAL_NVML else []          # Satisfy libnvidia-ml.so.1 before a proxy can win lookup.
+    if side == LEG:
+        env["NVIDIA_SIDECAR"] = "1"
+        pre = [REDIRECT] + pre
+    else:
+        env["NVIDIA_SIDECAR"] = "0"
+    if env.get("LD_PRELOAD"):
+        pre.append(env["LD_PRELOAD"])
+    if pre:
+        env["LD_PRELOAD"] = " ".join(pre)
+    return env
+
+
+def run(side, args):
+    p = subprocess.run([REAL] + args, env=side_env(side), capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def gpus(side):
+    """[(uuid, pci_bus_id)] for one driver."""
+    rc, out, err = run(side, ["--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"])
+    if rc != 0:
+        name = "sidecar" if side == LEG else "primary"
+        raise RuntimeError(f"{name} driver inventory query failed (exit {rc}): {err.strip() or out.strip() or 'no diagnostic'}")
+    return [tuple(x.strip() for x in l.split(",")) for l in out.splitlines() if l.strip()]
+
+
+# Work out which real driver owns each selector.
+def split_id(args):
+    """Pull every -i/--id selector out of an argument list."""
+    rest, identifiers, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-i", "--id") and i + 1 < len(args):
+            identifiers.append(args[i + 1]); i += 2; continue
+        if a.startswith("--id=") or a.startswith("-i="):
+            identifiers.append(a.split("=", 1)[1]); i += 1; continue
+        rest.append(a); i += 1
+    return rest, ",".join(identifiers) if identifiers else None
+
+
+def route_ids(ident, host, leg):
+    """Turn merged indices, UUIDs or PCI IDs into per-driver selectors."""
+    out = {HOST: [], LEG: []}
+    for t in [x.strip() for x in ident.split(",") if x.strip()]:
+        if t.isdigit():
+            n = int(t)
+            if n < len(host):
+                out[HOST].append(str(n))
+            elif n < len(host) + len(leg):
+                out[LEG].append(str(n - len(host)))
+            else:
+                raise ValueError(f"GPU index {n} is outside the merged range 0..{len(host) + len(leg) - 1}")
+            continue
+        low = t.lower()
+        for side, lst in ((HOST, host), (LEG, leg)):
+            if any(low == u.lower() or (low.startswith("gpu-") and u.lower().startswith(low)) or
+                   low in p.lower() or p.lower().endswith(low) for u, p in lst):
+                out[side].append(t); break
+        else:
+            raise ValueError(f"GPU identifier {t!r} does not match either driver")
+    return out
+
+
+# Stitch the two real outputs back into the shape nvidia-smi normally prints.
+def renumber_lead(line, offset, pattern=r"^(\|?\s*)(\d+)(\s)"):
+    def sub(m):
+        n = str(int(m.group(2)) + offset)
+        width = len(m.group(1)) + len(m.group(2))
+        lead = m.group(1).rstrip(" ") if m.group(1).startswith("|") else ""
+        return (lead + n.rjust(width - len(lead))) + m.group(3)
+    return re.sub(pattern, sub, line, count=1)
+
+
+def merge_default(h, l, off):
+    hl, ll = h.splitlines(), l.splitlines()
+
+    def gpu_section(lines):
+        start = next((i for i, x in enumerate(lines) if x.startswith("|==") and "+" in x), None)
+        if start is None:
+            return None, None
+        end = next((i for i in range(start + 1, len(lines)) if not lines[i].strip()), len(lines))
+        return start + 1, end
+
+    def proc_rows(lines):
+        start = next((i for i, x in enumerate(lines) if x.startswith("|==") and "+" not in x), None)
+        if start is None:
+            return None, None
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("+")), len(lines))
+        return start + 1, end
+
+    ls, le = gpu_section(ll)
+    hs, he = gpu_section(hl)
+    if hs is None and ls is not None and not h.strip():      # A sidecar-only -i result still needs merged numbering.
+        hl = [x for x in ll[:ls] + ll[le:] if not re.match(r"^\|\s+\d+\s", x)]
+        hs, he = gpu_section(hl)
+    if ls is None or hs is None:
+        return h.rstrip("\n") + "\n\n" + l
+    blocks, first = [], True
+    for x in ll[ls:le]:
+        if first and re.match(r"^\|\s+\d+\s", x):
+            x = renumber_lead(x, off)
+            first = False
+        elif x.startswith("+"):
+            first = True
+        blocks.append(x)
+    merged = hl[:he] + blocks + hl[he:]
+    ps, pe = proc_rows(ll)
+    rows = [renumber_lead(x, off) for x in ll[ps:pe] if re.match(r"^\|\s+\d+\s", x)] if ps is not None else []
+    if rows:
+        ms, me = proc_rows(merged)
+        if ms is not None:
+            body = [x for x in merged[ms:me] if "No running processes found" not in x]
+            merged = merged[:ms] + body + rows + merged[me:]
+    return "\n".join(merged) + "\n"
+
+
+def merge_list(h, l, off):
+    out = h.rstrip("\n").splitlines()
+    out += [re.sub(r"^GPU (\d+):", lambda m: f"GPU {int(m.group(1)) + off}:", x) for x in l.splitlines() if x.strip()]
+    return "\n".join(out) + "\n"
+
+
+def merge_csv(h, l, off, args):
+    fmt = next((a.split("=", 1)[1] for a in args if a.startswith("--format=")), "")
+    header = "noheader" not in fmt
+    q = next((a.split("=", 1)[1] for a in args if a.startswith("--query-gpu=")), None)
+    idx_col = None
+    if q is not None:
+        fields = [f.strip() for f in q.split(",")]
+        idx_col = fields.index("index") if "index" in fields else None
+    lrows = l.splitlines()
+    if header and lrows and h.strip():
+        lrows = lrows[1:]
+    if idx_col is not None:
+        fixed = []
+        for r in lrows:
+            cells = r.split(",")
+            if idx_col < len(cells) and cells[idx_col].strip().isdigit():
+                v = cells[idx_col]
+                cells[idx_col] = v.replace(v.strip(), str(int(v.strip()) + off))
+            fixed.append(",".join(cells))
+        lrows = fixed
+    return h.rstrip("\n") + ("\n" if h.strip() else "") + "\n".join(x for x in lrows if x.strip()) + "\n"
+
+
+def merge_q(h, l, xml):
+    if xml:
+        hm = re.search(r"<attached_gpus>(\d+)</attached_gpus>", h)
+        lm = re.search(r"<attached_gpus>(\d+)</attached_gpus>", l)
+        gpus_l = re.findall(r"(\t<gpu id=.*?</gpu>\n)", l, re.S)
+        if not (hm and lm):
+            return h + l
+        h = h.replace(hm.group(0), f"<attached_gpus>{int(hm.group(1)) + int(lm.group(1))}</attached_gpus>")
+        return h.replace("</nvidia_smi_log>", "".join(gpus_l) + "</nvidia_smi_log>")
+    hm = re.search(r"(Attached GPUs\s*:\s*)(\d+)", h)
+    lm = re.search(r"Attached GPUs\s*:\s*(\d+)", l)
+    li = l.find("\nGPU ")
+    if not (hm and lm) or li < 0:
+        return h.rstrip("\n") + "\n\n" + l
+    h = h[:hm.start()] + hm.group(1) + str(int(hm.group(2)) + int(lm.group(1))) + h[hm.end():]
+    return h.rstrip("\n") + "\n" + l[li:]
+
+
+def stream_mon(args, off, sides=(HOST, LEG), ids=None):
+    """Stream dmon/pmon from both drivers with one header and merged GPU indices."""
+    lock = threading.Lock()
+    def side_args(side):
+        return args if ids is None else args + ["-i", ",".join(ids[side])]
+    procs = [subprocess.Popen([REAL] + side_args(s), env=side_env(s), stdout=subprocess.PIPE, text=True, bufsize=1)
+             for s in sides]
+
+    # Print the shared header first. Otherwise the sidecar process can win startup and put data above pmon's header.
+    first = {}
+    if HOST in sides:
+        hp = procs[sides.index(HOST)]
+        while True:
+            line = hp.stdout.readline()
+            if not line:
+                break
+            if line.startswith("#"):
+                sys.stdout.write(line)
+                continue
+            first[HOST] = line
+            break
+        sys.stdout.flush()
+
+    def pump(side, p):
+        lines = iter(p.stdout)
+        pending = first.get(side)
+        if pending is not None:
+            lines = itertools.chain((pending,), lines)
+        for line in lines:
+            if side == LEG:
+                if line.startswith("#") and HOST in sides:
+                    continue
+                line = renumber_lead(line, off, r"^(\s*)(\d+)(\s)")
+            with lock:
+                sys.stdout.write(line); sys.stdout.flush()
+
+    ts = [threading.Thread(target=pump, args=(s, p), daemon=True) for s, p in zip(sides, procs)]
+    for t in ts:
+        t.start()
+    try:
+        for p in procs:
+            p.wait()
+    except KeyboardInterrupt:
+        for p in procs:
+            p.terminate()
+    return max(p.returncode or 0 for p in procs)
+
+
+def snapshot(args, off, ids=None):
+    """Run one non-streaming snapshot and merge its return code, output and diagnostics."""
+    def go(side):
+        if ids is None:
+            return run(side, args)
+        if not ids[side]:
+            return 0, "", ""
+        return run(side, args + ["-i", ",".join(ids[side])])
+    rh, oh, eh = go(HOST)
+    rl, ol, el = go(LEG)
+    if any(a in ("-L", "--list-gpus") for a in args):
+        out = merge_list(oh, ol, off)
+    elif any(a.startswith("--query-") for a in args):
+        out = merge_csv(oh, ol, off, args)
+    elif any(a in ("-q", "--query") for a in args):
+        out = merge_q(oh, ol, any(a in ("-x", "--xml-format") for a in args))
+    elif not [a for a in args if not a.startswith("-")]:
+        out = merge_default(oh, ol, off)
+    else:
+        out = oh.rstrip("\n") + "\n" + ol
+    return max(rh, rl), out, eh + el
+
+
+def loop_interval(args):
+    """Remove nvidia-smi's loop flags and return the requested interval in seconds."""
+    rest, secs, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        m = re.match(r"^(--loop|-l)(?:=(\d+))?$", a)
+        mm = re.match(r"^(--loop-ms|-lms)(?:=(\d+))?$", a)
+        if m or mm:
+            val = (m or mm).group(2)
+            if val is None and i + 1 < len(args) and args[i + 1].isdigit():
+                val = args[i + 1]; i += 1
+            secs = (int(val) if val else 5) if m else (int(val) if val else 1000) / 1000.0
+            i += 1; continue
+        rest.append(a); i += 1
+    return rest, secs
+
+
+def main():
+    args = sys.argv[1:]
+    if (os.environ.get("NVIDIA_SMI_NO_MERGE") == "1" or os.environ.get("NVIDIA_SIDECAR") or
+            not os.path.exists(f"/dev/nvidia-{SUFFIX}/nvidiactl") or not os.path.exists(REDIRECT) or
+            any(a in ("-h", "--help", "--version") for a in args)):
+        passthrough(args)
+    try:
+        host = gpus(HOST)
+        leg = gpus(LEG)
+    except RuntimeError as exc:
+        sys.exit(f"nvidia-smi (sidecar): {exc}")
+    if not leg:
+        passthrough(args)
+    off = len(host)
+    rest, ident = split_id(args)
+    ids = None
+    if ident is not None:
+        try:
+            ids = route_ids(ident, host, leg)
+        except ValueError as exc:
+            sys.exit(f"nvidia-smi (sidecar): {exc}")
+        sides = [s for s in (HOST, LEG) if ids[s]]
+        if sides == [HOST]:                  # Host-only indices already match, so the real tool can take over.
+            os.execve(REAL, [REAL] + rest + ["-i", ",".join(ids[HOST])], side_env(HOST))
+        args = rest
+    if args and args[0] in ("dmon", "pmon"):
+        if ids is not None:
+            sides = tuple(s for s in (HOST, LEG) if ids[s])
+            return stream_mon(args, off, sides=sides, ids=ids)
+        return stream_mon(args, off)
+    args, secs = loop_interval(args)
+    while True:
+        rc, out, err = snapshot(args, off, ids)
+        sys.stdout.write(out)
+        if err:
+            sys.stderr.write(err)
+        sys.stdout.flush()
+        if secs is None:
+            return rc
+        try:
+            time.sleep(secs)
+        except KeyboardInterrupt:
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

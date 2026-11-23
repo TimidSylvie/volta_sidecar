@@ -1,0 +1,8 @@
+nvidia-sidecar
+Copyright 2026 Benjamin (Sylvie) Edgar
+
+nvidia-sidecar lets legacy NVIDIA GPUs (Maxwell, Pascal and Volta) run beside newer GPUs on one Linux kernel without
+a VM. It does this by renaming a copy of NVIDIA's proprietary kernel module so it can load beside the open one.
+
+This product does not include NVIDIA software. It downloads NVIDIA's driver installer from NVIDIA and modifies a copy
+on the user's machine; NVIDIA's license terms apply to NVIDIA's files.

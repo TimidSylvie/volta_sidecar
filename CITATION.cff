@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use or build on nvidia-sidecar, please cite it."
+title: "nvidia-sidecar: legacy NVIDIA GPUs with CUDA beside newer ones on one Linux kernel"
+authors:
+  - given-names: "Benjamin (Sylvie)"
+    family-names: "Edgar"
+version: "0.2.0"
+date-released: "2026-11-23"
+license: Apache-2.0
+repository-code: "https://github.com/TimidSylvie/volta_sidecar"

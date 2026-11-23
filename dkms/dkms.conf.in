@@ -1,0 +1,14 @@
+# nvidia-sidecar: NVIDIA's proprietary kernel modules, renamed (nvidia_@SUFFIX@) to load beside the open ones.
+# DKMS rebuilds these renamed modules for each new kernel from our patched source tree.
+PACKAGE_NAME="nvidia-@SUFFIX@"
+PACKAGE_VERSION="@VERSION@"
+# DKMS exports KERNELRELEASE; NVIDIA's Makefile would then act as a Kbuild file, so clear it for the top level only
+MAKE[0]="env -u KERNELRELEASE make -j$(nproc) modules KERNEL_UNAME=${kernelver} NV_KERNEL_MODULES='nvidia nvidia-uvm'"
+CLEAN="make clean NV_KERNEL_MODULES='nvidia nvidia-uvm'"
+BUILT_MODULE_NAME[0]="nvidia_@SUFFIX@"
+BUILT_MODULE_LOCATION[0]="."
+DEST_MODULE_LOCATION[0]="/updates/dkms"
+BUILT_MODULE_NAME[1]="nvidia_@SUFFIX@_uvm"
+BUILT_MODULE_LOCATION[1]="."
+DEST_MODULE_LOCATION[1]="/updates/dkms"
+AUTOINSTALL="yes"

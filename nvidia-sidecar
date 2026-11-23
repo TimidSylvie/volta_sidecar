@@ -1,0 +1,903 @@
+#!/usr/bin/env bash
+# nvidia-sidecar: the bridge that lets old and new NVIDIA GPUs work beside each other on one Linux machine.
+# The commands below build, install, expose and remove it without needing a VM. See README.md for the why.
+#
+#   nvidia-sidecar doctor                    check this machine
+#   nvidia-sidecar setup [OPTIONS]           guarded, one-command install
+#   nvidia-sidecar fetch  [VERSION]          download + unpack NVIDIA's installer of that version (default: the
+#                                            version of your loaded open driver)
+#   nvidia-sidecar patch  [--ids 1db6,...]   copy its proprietary kernel source, rename it, register it with DKMS
+#   nvidia-sidecar install                   build + install the modules (DKMS), modprobe options, the boot service
+#   nvidia-sidecar up | down                 load the modules, create the legacy GPUs' device files, persistence
+#   nvidia-sidecar run [--user U] [--bg NAME] -- CMD...   run CMD with the legacy GPUs as its NVIDIA devices
+#   nvidia-sidecar bindpaths                 the BindPaths= lines for your own systemd services
+#   nvidia-sidecar userspace                 build + install the NVML/CUDA proxies and the merged nvidia-smi
+#   nvidia-sidecar seamless on|off|status    every program sees every GPU (proxies on the library path,
+#                                            nvidia-smi wrapper on PATH); off restores the plain driver
+#   nvidia-sidecar env                       the same for one shell only: eval "$(nvidia-sidecar env)"
+#   nvidia-sidecar status
+#   nvidia-sidecar version
+#   nvidia-sidecar verify                    verify the installed core/proxy from a fresh process
+#   nvidia-sidecar uninstall
+set -uo pipefail
+
+SCRIPT_PATH=${BASH_SOURCE[0]:-$0}
+HERE=$(cd "$(dirname "$(readlink -f "$SCRIPT_PATH")")" && pwd)
+SIDECAR_RELEASE=0.2.0
+CONF=/etc/nvidia-sidecar/sidecar.conf
+STATE=/var/lib/nvidia-sidecar
+[ -r "$CONF" ] && . "$CONF"
+SUFFIX=${SUFFIX:-sidecar}
+MOD=nvidia_$SUFFIX
+NODES=/dev/nvidia-$SUFFIX            # devtmpfs allows device nodes here; /run is mounted nodev
+PROC=/proc/driver/$MOD
+INSTALL_ROOT=/usr/local/lib/nvidia-sidecar
+CLI_LINK=/usr/local/sbin/nvidia-sidecar
+MODPROBE_CONF=/etc/modprobe.d/nvidia-$SUFFIX.conf
+BOOT_SERVICE=/etc/systemd/system/nvidia-sidecar.service
+PERSIST_SERVICE=/etc/systemd/system/nvidia-sidecar-persistenced.service
+INSTALL_MANIFEST=$STATE/install.json
+SOURCE_ROOT=/usr/src
+MODULES_ROOT=/lib/modules
+
+die() { echo "nvidia-sidecar: $*" >&2; exit 1; }
+say() { echo "nvidia-sidecar: $*"; }
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo)"; }
+valid_version() { [[ "${1:-}" =~ ^580\.[0-9]+(\.[0-9]+)?$ ]]; }
+validate_config() {
+  [[ "$SUFFIX" =~ ^[a-z][a-z0-9]{1,15}$ ]] || die "invalid SUFFIX in $CONF (use 2-16 lowercase letters/digits)"
+  if [ -n "${POWER_LIMIT_W:-}" ]; then
+    [[ "$POWER_LIMIT_W" =~ ^[0-9]{2,4}$ ]] || die "invalid POWER_LIMIT_W in $CONF"
+  fi
+}
+version_of_source() {
+  local v
+  v=$(cat "$STATE/version" 2>/dev/null) || return 1
+  valid_version "$v" || return 1
+  printf '%s\n' "$v"
+}
+owned_install_root() {
+  [ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] &&
+    [ -f "$INSTALL_ROOT/nvidia-sidecar" ] &&
+    grep -q '^# nvidia-sidecar:' "$INSTALL_ROOT/nvidia-sidecar"
+}
+path_exists() { [ -e "$1" ] || [ -L "$1" ]; }
+managed_text_file() { [ -f "$1" ] && grep -q '^# nvidia-sidecar managed' "$1"; }
+owned_system_target() {
+  managed_text_file "$1" && return 0
+  case "$1" in
+    "$MODPROBE_CONF") [ -f "$1" ] && grep -q "^options $MOD NVreg_ModifyDeviceFiles=0$" "$1" ;;
+    "$BOOT_SERVICE") [ -f "$1" ] && grep -q '^Description=nvidia-sidecar:' "$1" ;;
+    "$PERSIST_SERVICE") [ -f "$1" ] && grep -q '^Description=nvidia-sidecar:' "$1" ;;
+    "$CLI_LINK") [ -L "$1" ] && [ "$(readlink "$1" 2>/dev/null)" = "$INSTALL_ROOT/nvidia-sidecar" ] ;;
+    *) return 1 ;;
+  esac
+}
+validate_config
+
+cmd_doctor() { python3 "$HERE/lib/detect.py" report "$@"; }
+
+id_allowed_by_setup_policy() {
+  local driver=$1 device_id=$2 allow_untested=$3
+  [ "$allow_untested" = 1 ] ||
+    python3 "$HERE/lib/detect.py" release-ids "$driver" | grep -qx "$device_id"
+}
+
+cmd_fetch() {
+  need_root
+  local v="" arg status expected actual run url tmp extract_new extract_old
+  while [ $# -gt 0 ]; do
+    arg=$1; shift
+    case "$arg" in
+      --allow-untested) : ;; # Old scripts may still pass this; exact-match R580 releases no longer need it.
+      --*) die "unknown fetch option: $arg" ;;
+      *) [ -z "$v" ] || die "fetch accepts only one driver version"; v=$arg ;;
+    esac
+  done
+  v=${v:-$(python3 "$HERE/lib/detect.py" open-version)}
+  [ -n "$v" ] || die "no open driver loaded; give the version: nvidia-sidecar fetch 580.xx.xx"
+  valid_version "$v" || die "version $v: only the 580 branch drives Maxwell/Pascal/Volta"
+  status=$(python3 "$HERE/lib/detect.py" version-status "$v" 2>/dev/null || true)
+  [ "$status" = tested ] || say "note: R580 point release $v is not physically tested here; patch/build/verification remain fail-closed"
+  run="NVIDIA-Linux-x86_64-$v.run"
+  url="https://download.nvidia.com/XFree86/Linux-x86_64/$v/$run"
+  mkdir -p "$STATE/downloads"
+  if [ ! -s "$STATE/downloads/$run" ]; then
+    say "downloading $url (NVIDIA's license applies to its contents)"
+    tmp="$STATE/downloads/$run.part.$$"
+    rm -f "$tmp"
+    curl -fL# --retry 3 -o "$tmp" "$url" || { rm -f "$tmp"; die "download failed"; }
+    mv "$tmp" "$STATE/downloads/$run" || { rm -f "$tmp"; die "could not save the download"; }
+  fi
+  expected=$(python3 "$HERE/lib/detect.py" installer-sha "$v" 2>/dev/null || true)
+  actual=$(sha256sum "$STATE/downloads/$run" | awk '{print $1}')
+  if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then
+    die "$run SHA-256 mismatch (expected $expected, got $actual); delete the file before retrying"
+  fi
+  sh "$STATE/downloads/$run" --check >/dev/null || die "$run fails its own integrity check; delete it and fetch again"
+  extract_new="$STATE/extract.new.$$"
+  extract_old="$STATE/extract.old.$$"
+  rm -rf "$extract_new" "$extract_old"
+  sh "$STATE/downloads/$run" --extract-only --target "$extract_new" >/dev/null || { rm -rf "$extract_new"; die "could not unpack $run"; }
+  [ -f "$extract_new/kernel/nvidia/nv-kernel.o_binary" ] || { rm -rf "$extract_new"; die "$run has no proprietary kernel source (kernel/)"; }
+  [ -f "$extract_new/supported-gpus/supported-gpus.json" ] || { rm -rf "$extract_new"; die "$run has no supported-gpus catalog"; }
+  [ ! -e "$STATE/extract" ] || mv "$STATE/extract" "$extract_old" || { rm -rf "$extract_new"; die "could not preserve the prior extraction"; }
+  if ! mv "$extract_new" "$STATE/extract"; then
+    [ ! -e "$extract_old" ] || mv "$extract_old" "$STATE/extract"
+    die "could not activate the extracted driver"
+  fi
+  printf '%s\n' "$v" > "$STATE/version.new" && mv "$STATE/version.new" "$STATE/version" || {
+    rm -rf "$STATE/extract"; [ ! -e "$extract_old" ] || mv "$extract_old" "$STATE/extract"
+    die "could not record the driver version"
+  }
+  rm -rf "$extract_old"
+  say "unpacked NVIDIA $v; proprietary kernel source: $STATE/extract/kernel"
+}
+
+cmd_patch() {
+  need_root
+  local ids="" v catalog existing
+  v=$(version_of_source) || die "missing or invalid $STATE/version; run 'nvidia-sidecar fetch' first"
+  if [ "${1:-}" = "--ids" ]; then
+    [ $# -ge 2 ] || die "--ids needs a comma-separated value"
+    ids=$2
+    shift 2
+  fi
+  [ $# = 0 ] || die "usage: nvidia-sidecar patch [--ids 1db6,1b80]"
+  [ -n "$ids" ] || ids=$(python3 "$HERE/lib/detect.py" legacy-ids | paste -sd,)
+  [ -n "$ids" ] || die "no legacy GPU found; give them: nvidia-sidecar patch --ids 1db6,1b80"
+  ids=$(python3 "$HERE/lib/detect.py" normalize-ids "$ids") ||
+    die "invalid --ids: use comma-separated 16-bit hexadecimal PCI device IDs"
+  catalog="$STATE/extract/supported-gpus/supported-gpus.json"
+  python3 "$HERE/lib/detect.py" validate-ids "$catalog" "$ids" ||
+    die "refusing to patch the proprietary driver for an unsupported or modern GPU"
+  local src=$SOURCE_ROOT/nvidia-$SUFFIX-$v
+  if [ -f "$src/.nvidia-sidecar-patched" ]; then
+    existing=$(awk -F= '$1=="ids"{print toupper($2)}' "$src/.nvidia-sidecar-patched")
+    [ "$existing" = "$ids" ] || die "$src is already patched for $existing, not $ids"
+    printf '%s\n' "$ids" > "$STATE/ids"
+    say "patched source already present: $src"
+    return 0
+  fi
+  [ ! -e "$src" ] || die "$src exists but is not a recognized nvidia-sidecar source tree"
+  cp -a "$STATE/extract/kernel" "$src" || die "copy failed"
+  python3 "$HERE/lib/patch_driver.py" --source "$src" --ids "$ids" --suffix "$SUFFIX" || { rm -rf "$src"; die "patch failed"; }
+  sed -e "s/@SUFFIX@/$SUFFIX/g; s/@VERSION@/$v/g" "$HERE/dkms/dkms.conf.in" > "$src/dkms.conf"
+  mkdir -p "$(dirname "$CONF")"
+  [ -f "$CONF" ] || { printf '# nvidia-sidecar managed configuration\nSUFFIX=%s\n# POWER_LIMIT_W=170   # optional: power limit for every legacy GPU at "up"\n' "$SUFFIX" > "$CONF.new" && mv "$CONF.new" "$CONF"; }
+  printf '%s\n' "$ids" > "$STATE/ids.new" && mv "$STATE/ids.new" "$STATE/ids"
+  say "patched source: $src (legacy GPUs: $ids)"
+}
+
+cmd_install() {
+  need_root
+  local v src package txn stage had_dkms=0 was_enabled=0 target key previous_mode
+  v=$(version_of_source) || die "missing or invalid $STATE/version; run fetch and patch first"
+  src=$SOURCE_ROOT/nvidia-$SUFFIX-$v
+  package=nvidia-$SUFFIX
+  previous_mode=${NVIDIA_SIDECAR_PRIOR_MODE:-}
+  [ -n "$previous_mode" ] || previous_mode=$(manifest_field activation_mode 2>/dev/null || true)
+  [ -f "$src/.nvidia-sidecar-patched" ] || die "run 'nvidia-sidecar patch' first"
+  command -v dkms >/dev/null || die "DKMS is required for the guarded installer (install the dkms package)"
+
+  # Only replace paths we can prove came from an earlier nvidia-sidecar install.
+  path_exists "$INSTALL_ROOT" && ! owned_install_root &&
+    die "$INSTALL_ROOT already exists and is not a recognized nvidia-sidecar install"
+  for target in "$MODPROBE_CONF" "$BOOT_SERVICE" "$PERSIST_SERVICE" "$CLI_LINK"; do
+    path_exists "$target" && ! owned_system_target "$target" &&
+      die "$target already exists and is not owned by nvidia-sidecar"
+  done
+
+  dkms status -m "$package" -v "$v" | grep -q . && had_dkms=1
+  [ "$had_dkms" = 1 ] || dkms add -m "$package" -v "$v" || die "dkms add failed"
+  if ! dkms status -m "$package" -v "$v" -k "$(uname -r)" | grep -q 'installed'; then
+    if ! dkms build -m "$package" -v "$v" -k "$(uname -r)" ||
+       ! dkms install -m "$package" -v "$v" -k "$(uname -r)"; then
+      [ "$had_dkms" = 1 ] || dkms remove -m "$package" -v "$v" --all >/dev/null 2>&1 || true
+      die "dkms build/install failed (see /var/lib/dkms/$package/$v/build/make.log)"
+    fi
+  fi
+
+  txn="$STATE/transactions/install.$$"
+  stage="$txn/repo.new"
+  rm -rf "$txn"
+  mkdir -p "$stage" "$txn/backup"
+  tar -C "$HERE" --exclude=.git --exclude=build --exclude='__pycache__' --exclude='*.pyc' -cf - . |
+    tar -C "$stage" -xf - || { rm -rf "$txn"; die "could not stage the installation payload"; }
+  if [ -d "$INSTALL_ROOT/userspace" ] && [ ! -e "$stage/userspace" ]; then
+    cp -a "$INSTALL_ROOT/userspace" "$stage/userspace" || { rm -rf "$txn"; die "could not preserve the installed userspace proxy"; }
+  fi
+  chmod 0755 "$stage/nvidia-sidecar"
+  {
+    echo '# nvidia-sidecar managed: CUDA must not repair sidecar device nodes back to major 195'
+    printf 'options %s NVreg_ModifyDeviceFiles=0\nsoftdep %s post: %s_uvm\n' "$MOD" "$MOD" "$MOD"
+  } > "$txn/modprobe.conf"
+  { echo '# nvidia-sidecar managed systemd unit'; sed "s/@SUFFIX@/$SUFFIX/g" "$HERE/systemd/nvidia-sidecar.service"; } > "$txn/boot.service"
+  { echo '# nvidia-sidecar managed systemd unit'; sed "s/@SUFFIX@/$SUFFIX/g" "$HERE/systemd/nvidia-sidecar-persistenced.service"; } > "$txn/persist.service"
+  if ! python3 - "$txn/install.json" "$SIDECAR_RELEASE" "$v" "$SUFFIX" "$(cat "$STATE/ids")" "$previous_mode" <<'PY'
+import json, sys, time
+path, release, driver, suffix, ids, previous_mode = sys.argv[1:]
+data = {"schema": 1, "release": release, "driver_version": driver, "suffix": suffix,
+        "legacy_ids": ids.split(","), "installed_at": int(time.time())}
+if previous_mode:
+    data["activation_mode"] = previous_mode
+with open(path, "w") as out:
+    json.dump(data, out, indent=2)
+    out.write("\n")
+PY
+  then
+    [ "$had_dkms" = 1 ] || dkms remove -m "$package" -v "$v" --all >/dev/null 2>&1 || true
+    rm -rf "$txn"
+    die "could not stage $INSTALL_MANIFEST"
+  fi
+
+  systemctl is-enabled nvidia-sidecar.service >/dev/null 2>&1 && was_enabled=1
+  key=0
+  for target in "$MODPROBE_CONF" "$BOOT_SERVICE" "$PERSIST_SERVICE" "$CLI_LINK"; do
+    key=$((key + 1))
+    if path_exists "$target"; then cp -a "$target" "$txn/backup/$key" || { rm -rf "$txn"; die "could not back up $target"; }; fi
+  done
+  path_exists "$INSTALL_MANIFEST" && cp -a "$INSTALL_MANIFEST" "$txn/backup/install.json"
+
+  if ! (
+    mkdir -p "$(dirname "$MODPROBE_CONF")" "$(dirname "$BOOT_SERVICE")" \
+      "$(dirname "$PERSIST_SERVICE")" "$(dirname "$INSTALL_ROOT")" "$(dirname "$CLI_LINK")" || exit 1
+    install -m 0644 "$txn/modprobe.conf" "$MODPROBE_CONF" || exit 1
+    install -m 0644 "$txn/boot.service" "$BOOT_SERVICE" || exit 1
+    install -m 0644 "$txn/persist.service" "$PERSIST_SERVICE" || exit 1
+    if path_exists "$INSTALL_ROOT"; then mv "$INSTALL_ROOT" "$txn/repo.old" || exit 1; fi
+    mv "$stage" "$INSTALL_ROOT" || exit 1
+    ln -sfn "$INSTALL_ROOT/nvidia-sidecar" "$CLI_LINK" || exit 1
+    systemctl daemon-reload || exit 1
+    systemctl enable nvidia-sidecar.service >/dev/null || exit 1
+    mv "$txn/install.json" "$INSTALL_MANIFEST.new" || exit 1
+    mv "$INSTALL_MANIFEST.new" "$INSTALL_MANIFEST" || exit 1
+  ); then
+    say "install failed; restoring the prior system files"
+    rm -rf "$INSTALL_ROOT"
+    [ ! -e "$txn/repo.old" ] || mv "$txn/repo.old" "$INSTALL_ROOT"
+    key=0
+    for target in "$MODPROBE_CONF" "$BOOT_SERVICE" "$PERSIST_SERVICE" "$CLI_LINK"; do
+      key=$((key + 1)); rm -f "$target"
+      [ ! -e "$txn/backup/$key" ] && [ ! -L "$txn/backup/$key" ] || cp -a "$txn/backup/$key" "$target"
+    done
+    [ "$was_enabled" = 1 ] || systemctl disable nvidia-sidecar.service >/dev/null 2>&1 || true
+    rm -f "$INSTALL_MANIFEST" "$INSTALL_MANIFEST.new"
+    [ ! -e "$txn/backup/install.json" ] || cp -a "$txn/backup/install.json" "$INSTALL_MANIFEST"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    [ "$had_dkms" = 1 ] || dkms remove -m "$package" -v "$v" --all >/dev/null 2>&1 || true
+    rm -rf "$txn"
+    die "install rolled back"
+  fi
+  rm -rf "$txn"
+  say "installed; start it now with: sudo nvidia-sidecar up   (it also starts at every boot)"
+}
+
+minors() { awk '/Device Minor/{print $NF}' "$PROC"/gpus/*/information 2>/dev/null; }
+
+sidecar_devices() {
+  local device bdf device_id
+  for device in "/sys/bus/pci/drivers/$MOD/"????:??:??.?; do
+    [ -r "$device/device" ] || continue
+    bdf=${device##*/}
+    device_id=$(cat "$device/device") || continue
+    printf '%s\t%s\n' "$bdf" "$(printf '%s' "$device_id" | sed 's/^0x//' | tr '[:lower:]' '[:upper:]')"
+  done
+}
+
+node_dir_owned() {
+  [ -d "$NODES" ] && [ ! -L "$NODES" ] || return 1
+  [ -f "$NODES/.nvidia-sidecar-managed" ] && return 0
+  local entry base
+  for entry in "$NODES"/*; do
+    [ -e "$entry" ] || continue
+    base=${entry##*/}
+    case "$base" in nvidiactl|nvidia-uvm|nvidia-uvm-tools|nvidia[0-9]*) ;; *) return 1 ;; esac
+    [ -c "$entry" ] || return 1
+  done
+  [ -c "$NODES/nvidiactl" ]
+}
+
+bind_list() {   # One SOURCE:DEST mapping per line.
+  local m
+  for m in $(minors); do echo "$NODES/nvidia$m:/dev/nvidia$m"; done
+  echo "$NODES/nvidiactl:/dev/nvidiactl"
+  echo "$NODES/nvidia-uvm:/dev/nvidia-uvm"
+  echo "$NODES/nvidia-uvm-tools:/dev/nvidia-uvm-tools"
+  echo "$PROC:/proc/driver/nvidia"
+}
+
+cmd_up() {
+  need_root
+  modprobe vsock_loopback 2>/dev/null || true
+  modprobe "$MOD" && modprobe "${MOD}_uvm" || die "could not load $MOD (see dmesg)"
+  local M U m new old
+  M=$(awk -v n="$MOD" '$2==n{print $1}' /proc/devices); U=$(awk -v n="$MOD-uvm" '$2==n{print $1}' /proc/devices)
+  [ -n "$M" ] && [ -n "$U" ] || die "$MOD loaded, but its device numbers are missing from /proc/devices"
+  [ -n "$(minors)" ] || die "$MOD claimed no GPU (is the legacy GPU bound to vfio-pci or nouveau?)"
+  path_exists "$NODES" && ! node_dir_owned && die "refusing to replace unrecognized $NODES"
+  new=$(mktemp -d "/dev/.nvidia-$SUFFIX.new.XXXXXX") || die "could not stage the sidecar device nodes"
+  old="/dev/.nvidia-$SUFFIX.old.$$"
+  rm -rf "$old"
+  for m in $(minors); do mknod -m 0666 "$new/nvidia$m" c "$M" "$m" || { rm -rf "$new"; die "could not create GPU device node $m"; }; done
+  mknod -m 0666 "$new/nvidiactl" c "$M" 255 &&
+    mknod -m 0666 "$new/nvidia-uvm" c "$U" 0 &&
+    mknod -m 0666 "$new/nvidia-uvm-tools" c "$U" 1 || { rm -rf "$new"; die "could not create sidecar control device nodes"; }
+  printf 'module=%s\nmajor=%s\nuvm_major=%s\n' "$MOD" "$M" "$U" > "$new/.nvidia-sidecar-managed"
+  [ ! -e "$NODES" ] || mv "$NODES" "$old" || { rm -rf "$new"; die "could not preserve the current device nodes"; }
+  if ! mv "$new" "$NODES"; then
+    [ ! -e "$old" ] || mv "$old" "$NODES"
+    die "could not activate the sidecar device nodes"
+  fi
+  rm -rf "$old"
+  # Keep the legacy GPUs initialized so things like their power limits actually stick.
+  mkdir -p /run/systemd/system/nvidia-sidecar-persistenced.service.d
+  { echo "[Service]"; bind_list | sed 's/^/BindPaths=/'; } > /run/systemd/system/nvidia-sidecar-persistenced.service.d/binds.conf
+  systemctl daemon-reload && systemctl restart nvidia-sidecar-persistenced.service || say "warning: the persistence daemon did not start"
+  if [ -n "${POWER_LIMIT_W:-}" ]; then
+    cmd_run_root nvidia-smi -pl "$POWER_LIMIT_W" >/dev/null && say "power limit ${POWER_LIMIT_W} W" || say "warning: power limit not applied"
+  fi
+  say "up: $(minors | wc -l) legacy GPU(s) on $MOD; try: nvidia-sidecar run -- nvidia-smi"
+}
+
+cmd_down() {
+  need_root
+  local u units
+  if systemctl is-active nvidia-sidecar-persistenced.service >/dev/null 2>&1; then
+    systemctl stop nvidia-sidecar-persistenced.service ||
+      die "could not stop nvidia-sidecar-persistenced.service"
+  fi
+  units=$(systemctl list-units --plain --no-legend 'nvidia-sidecar-run-*' | awk '{print $1}') ||
+    die "could not enumerate sidecar run units"
+  for u in $units; do systemctl stop "$u" || die "could not stop $u"; done
+  if path_exists "$NODES"; then
+    node_dir_owned || die "refusing to remove unrecognized $NODES"
+    rm -rf "$NODES" || die "could not remove $NODES"
+  fi
+  rm -rf /run/systemd/system/nvidia-sidecar-persistenced.service.d ||
+    die "could not remove the persistence runtime configuration"
+  if lsmod | awk '{print $1}' | grep -qx "$MOD\|${MOD}_uvm"; then
+    modprobe -r "${MOD}_uvm" "$MOD" 2>/dev/null || die "could not unload $MOD (is something still using a legacy GPU?)"
+  fi
+  say "down"
+}
+
+run_props() { local b; for b in $(bind_list); do printf -- '-p\nBindPaths=%s\n' "$b"; done; }
+
+cmd_run_root() {   # Root-only foreground helper used by up.
+  local props; mapfile -t props < <(run_props)
+  systemd-run --quiet --collect --pipe --wait "${props[@]}" -- "$@"
+}
+
+cmd_run() {
+  need_root
+  [ -c "$NODES/nvidiactl" ] || die "not up (sudo nvidia-sidecar up)"
+  local user=${SUDO_USER:-root} bg=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --user) [ $# -ge 2 ] || die "--user needs a value"; user=$2; shift 2 ;;
+    --bg) [ $# -ge 2 ] || die "--bg needs a value"; bg=$2; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac; done
+  [ $# -gt 0 ] || die "usage: nvidia-sidecar run [--user U] [--bg NAME] -- CMD..."
+  local props; mapfile -t props < <(run_props)
+  local common=(--uid="$user" --setenv=HOME="$(getent passwd "$user" | cut -d: -f6)" -p WorkingDirectory="$PWD" "${props[@]}")
+  if [ -n "$bg" ]; then
+    [[ "$bg" =~ ^[A-Za-z0-9_.-]+$ ]] || die "bad --bg name"
+    exec systemd-run --quiet --collect --no-block --unit="nvidia-sidecar-run-$bg" "${common[@]}" -- "$@"
+  fi
+  exec systemd-run --quiet --collect --pipe --wait "${common[@]}" -- "$@"
+}
+
+USERSPACE=/usr/local/lib/nvidia-sidecar/userspace
+LDCONF=/etc/ld.so.conf.d/000-nvidia-sidecar.conf
+SMI_LINK=/usr/local/bin/nvidia-smi
+SMI_BACKUP=$STATE/nvidia-smi.pre-seamless
+
+is_sidecar_smi() {
+  [ -L "$SMI_LINK" ] && [ "$(readlink "$SMI_LINK" 2>/dev/null)" = "$USERSPACE/nvidia-smi" ]
+}
+
+install_sidecar_smi() {
+  mkdir -p "$STATE" "$(dirname "$SMI_LINK")"
+  is_sidecar_smi && return 0
+  if [ -e "$SMI_BACKUP" ] || [ -L "$SMI_BACKUP" ]; then
+    say "refusing to replace $SMI_LINK: saved predecessor already exists at $SMI_BACKUP"
+    return 1
+  fi
+  local saved=0
+  if [ -e "$SMI_LINK" ] || [ -L "$SMI_LINK" ]; then
+    mv "$SMI_LINK" "$SMI_BACKUP" || return 1
+    saved=1
+  fi
+  if ! ln -s "$USERSPACE/nvidia-smi" "$SMI_LINK"; then
+    [ "$saved" = 1 ] && mv "$SMI_BACKUP" "$SMI_LINK"
+    return 1
+  fi
+}
+
+restore_prior_smi() {
+  if is_sidecar_smi; then
+    rm -f "$SMI_LINK" || return 1
+  elif [ -e "$SMI_LINK" ] || [ -L "$SMI_LINK" ]; then
+    if [ -e "$SMI_BACKUP" ] || [ -L "$SMI_BACKUP" ]; then
+      say "warning: $SMI_LINK changed while seamless mode was on; predecessor remains at $SMI_BACKUP"
+      return 1
+    fi
+    return 0
+  fi
+  if [ -e "$SMI_BACKUP" ] || [ -L "$SMI_BACKUP" ]; then
+    mv "$SMI_BACKUP" "$SMI_LINK" || return 1
+  fi
+}
+
+cmd_userspace() {
+  need_root
+  local tmp new old had_old=0
+  new=$USERSPACE.new
+  old=$USERSPACE.old
+  if [ ! -e "$USERSPACE" ] && [ -e "$old" ]; then
+    mv "$old" "$USERSPACE" || die "an interrupted userspace upgrade left $old; automatic recovery failed"
+    say "recovered the previous userspace install after an interrupted upgrade"
+  elif [ -e "$USERSPACE" ] && [ -e "$old" ]; then
+    [ -f "$USERSPACE/cuda/libcuda.so.1" ] || die "$USERSPACE is incomplete and a recovery copy exists at $old"
+    rm -rf "$old"
+  fi
+  tmp=$(mktemp -d) || die "could not create a build directory"
+  bash "$HERE/lib/build_userspace.sh" "$tmp" --prefix "$USERSPACE" || { rm -rf "$tmp"; die "userspace build failed"; }
+  [ -f "$tmp/cuda/libcuda.so.1" ] && [ -f "$tmp/nvml/libnvidia-ml.so.1" ] && [ -x "$tmp/nvidia-smi" ] ||
+    { rm -rf "$tmp"; die "userspace build did not produce the required proxy artifacts"; }
+  rm -rf "$new"
+  mkdir -p "$(dirname "$USERSPACE")"
+  cp -a "$tmp" "$new" || { rm -rf "$tmp" "$new"; die "could not stage the userspace build"; }
+  rm -rf "$tmp"
+  if [ -e "$USERSPACE" ]; then
+    mv "$USERSPACE" "$old" || { rm -rf "$new"; die "could not preserve the current userspace install"; }
+    had_old=1
+  fi
+  if ! mv "$new" "$USERSPACE" || ! chmod -R a+rX "$USERSPACE"; then
+    rm -rf "$USERSPACE" "$new"
+    if [ "$had_old" = 1 ] && ! mv "$old" "$USERSPACE"; then
+      die "userspace install and automatic rollback both failed; recovery copy: $old"
+    fi
+    die "userspace install failed; the previous install was restored"
+  fi
+  if [ -f "$LDCONF" ] && ! ldconfig; then
+    rm -rf "$USERSPACE"
+    if [ "$had_old" = 1 ] && ! mv "$old" "$USERSPACE"; then
+      die "ldconfig rejected the install and rollback failed; recovery copy: $old"
+    fi
+    ldconfig >/dev/null 2>&1 || die "ldconfig rejected the install and could not be restored"
+    die "ldconfig rejected the new userspace install; the previous install was restored"
+  fi
+  say "userspace installed in $USERSPACE (previous version, if any: $old)"
+}
+
+cmd_seamless() {
+  case "${1:-status}" in
+    on)
+      need_root
+      local was_on=0 smi_was_sidecar=0 conf_backup
+      [ -f "$LDCONF" ] && was_on=1
+      [ -f "$USERSPACE/cuda/libcuda.so.1" ] || cmd_userspace
+      if [ "$was_on" = 1 ] && ! grep -q '^# nvidia-sidecar:' "$LDCONF"; then
+        die "refusing to overwrite existing $LDCONF"
+      fi
+      is_sidecar_smi && smi_was_sidecar=1
+      conf_backup=$(mktemp) || die "could not create a seamless-mode transaction"
+      [ "$was_on" = 0 ] || cp -a "$LDCONF" "$conf_backup" ||
+        { rm -f "$conf_backup"; die "could not back up $LDCONF"; }
+      if ! install_sidecar_smi; then
+        rm -f "$conf_backup"
+        die "could not install the nvidia-smi wrapper"
+      fi
+      printf '# nvidia-sidecar: the CUDA and NVML proxies come before the driver'"'"'s own libraries\n%s\n%s\n' \
+        "$USERSPACE/cuda" "$USERSPACE/nvml" > "$LDCONF.new"
+      if ! mv "$LDCONF.new" "$LDCONF" || ! ldconfig; then
+        rm -f "$LDCONF" "$LDCONF.new"
+        [ "$was_on" = 0 ] || cp -a "$conf_backup" "$LDCONF"
+        ldconfig >/dev/null 2>&1 || true
+        [ "$smi_was_sidecar" = 1 ] || restore_prior_smi >/dev/null 2>&1 || true
+        rm -f "$conf_backup"
+        die "could not enable seamless mode; the prior loader and nvidia-smi state were restored"
+      fi
+      rm -f "$conf_backup"
+      say "seamless on: new processes see every GPU (already running ones keep what they loaded)"
+      say "check: nvidia-smi ; python3 -c 'import torch; print(torch.cuda.device_count())'" ;;
+    off)
+      need_root
+      local had_conf=0 conf_backup
+      if [ -f "$LDCONF" ]; then
+        grep -q '^# nvidia-sidecar:' "$LDCONF" || die "refusing to remove unrecognized $LDCONF"
+        had_conf=1
+      fi
+      conf_backup=$(mktemp) || die "could not create a seamless-mode transaction"
+      [ "$had_conf" = 0 ] || cp -a "$LDCONF" "$conf_backup" ||
+        { rm -f "$conf_backup"; die "could not back up $LDCONF"; }
+      rm -f "$LDCONF" "$LDCONF.new"
+      if ! ldconfig; then
+        [ "$had_conf" = 0 ] || cp -a "$conf_backup" "$LDCONF"
+        ldconfig >/dev/null 2>&1 || true
+        rm -f "$conf_backup"
+        die "ldconfig failed; seamless mode remains enabled"
+      fi
+      if ! restore_prior_smi; then
+        [ "$had_conf" = 0 ] || cp -a "$conf_backup" "$LDCONF"
+        ldconfig >/dev/null 2>&1 || true
+        rm -f "$conf_backup"
+        die "the prior nvidia-smi could not be restored; seamless loader state was put back"
+      fi
+      rm -f "$conf_backup"
+      say "seamless off: programs use the plain driver again (legacy GPUs via 'nvidia-sidecar run')" ;;
+    status)
+      local c expected
+      c=$(ldconfig -p | awk '$1=="libcuda.so.1"{print $NF; exit}')
+      if [ ! -f "$LDCONF" ]; then
+        echo "seamless: off   libcuda.so.1 -> $c   nvidia-smi -> $(command -v nvidia-smi)"
+        return 0
+      fi
+      echo "seamless: on   cache libcuda.so.1 -> $c   nvidia-smi -> $(command -v nvidia-smi)"
+      expected=$(python3 "$HERE/lib/detect.py" gpu-count)
+      env -u LD_LIBRARY_PATH python3 "$HERE/lib/verify_userspace.py" --expect "$expected" \
+        --show-libraries --require-proxy-root "$USERSPACE" ;;
+    *) die "usage: nvidia-sidecar seamless on|off|status" ;;
+  esac
+}
+
+cmd_env() {
+  [ -f "$USERSPACE/cuda/libcuda.so.1" ] || die "userspace not installed (sudo nvidia-sidecar userspace)"
+  echo "export LD_LIBRARY_PATH=$USERSPACE/cuda:$USERSPACE/nvml\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+  echo "alias nvidia-smi=$USERSPACE/nvidia-smi"
+}
+
+cmd_bindpaths() { [ -n "$(minors)" ] || die "not up"; bind_list | sed 's/^/BindPaths=/'; }
+
+cmd_verify() {
+  need_root
+  local count expected output proxy_env current_ld wanted actual expected_legacy bdfs
+  [ -d "/sys/module/$MOD" ] || die "$MOD is not loaded"
+  [ -d "/sys/module/${MOD}_uvm" ] || die "${MOD}_uvm is not loaded"
+  count=$(minors | wc -l)
+  [ "$count" -gt 0 ] || die "$MOD owns no GPUs"
+  wanted=$(python3 "$HERE/lib/detect.py" normalize-ids "$(cat "$STATE/ids" 2>/dev/null)") ||
+    die "the recorded legacy GPU IDs are missing or invalid"
+  actual=$(sidecar_devices | awk '{print $2}' | sort -u | paste -sd,)
+  [ "$actual" = "$wanted" ] ||
+    die "$MOD owns PCI IDs ${actual:-none}; expected $wanted"
+  expected_legacy=$(python3 "$HERE/lib/detect.py" count-ids "$wanted") ||
+    die "could not count the selected GPUs"
+  [ "$(sidecar_devices | wc -l)" = "$expected_legacy" ] ||
+    die "$MOD did not bind every present GPU selected by $wanted"
+  [ "$count" = "$expected_legacy" ] ||
+    die "sidecar device-minor count $count does not match selected GPU count $expected_legacy"
+  bdfs=$(sidecar_devices | awk '{print $1}' | paste -sd,)
+  [ -c "$NODES/nvidiactl" ] && [ -c "$NODES/nvidia-uvm" ] || die "sidecar device nodes are incomplete"
+  node_dir_owned || die "$NODES is not recognized as a managed node directory"
+  if [ ! -f "$LDCONF" ]; then
+    output=$(cmd_run_root /usr/bin/nvidia-smi -L) || die "the legacy driver failed its private nvidia-smi check"
+    [ -n "$output" ] || die "the legacy driver returned no GPUs"
+  fi
+  if [ -f "$USERSPACE/cuda/libcuda.so.1" ]; then
+    expected=$(python3 "$HERE/lib/detect.py" gpu-count)
+    proxy_env="$USERSPACE/cuda:$USERSPACE/nvml"
+    current_ld=${LD_LIBRARY_PATH-}
+    [ -z "$current_ld" ] || proxy_env="$proxy_env:$current_ld"
+    if [ -f "$LDCONF" ]; then
+      grep -q '^# nvidia-sidecar:' "$LDCONF" || die "unrecognized loader configuration at $LDCONF"
+      env -u LD_LIBRARY_PATH python3 "$HERE/lib/verify_userspace.py" --expect "$expected" --require-pci "$bdfs" ||
+        die "system-wide CUDA/NVML proxy verification failed"
+      nvidia-smi -L >/dev/null || die "merged nvidia-smi verification failed"
+    else
+      env LD_LIBRARY_PATH="$proxy_env" python3 "$HERE/lib/verify_userspace.py" --expect "$expected" --require-pci "$bdfs" ||
+        die "per-shell CUDA/NVML proxy verification failed"
+      "$USERSPACE/nvidia-smi" -L >/dev/null || die "merged nvidia-smi verification failed"
+    fi
+  fi
+  say "verified: $count legacy GPU(s); kernel modules and device namespace are healthy"
+}
+
+manifest_field() {
+  [ -f "$INSTALL_MANIFEST" ] || return 1
+  python3 - "$INSTALL_MANIFEST" "$1" <<'PY'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1])).get(sys.argv[2], "")
+except (OSError, ValueError):
+    raise SystemExit(1)
+if isinstance(value, list):
+    print(",".join(value))
+else:
+    print(value)
+PY
+}
+
+actual_activation_mode() {
+  if [ -f "$LDCONF" ]; then
+    grep -q '^# nvidia-sidecar:' "$LDCONF" || return 1
+    is_sidecar_smi || return 1
+    echo seamless
+  elif is_sidecar_smi; then
+    return 1
+  elif [ -f "$USERSPACE/cuda/libcuda.so.1" ]; then
+    echo shell
+  else
+    echo core
+  fi
+}
+
+restore_userspace_snapshot() {
+  local prior_had=$1 failed
+  if [ -e "$USERSPACE.old" ]; then
+    failed="$USERSPACE.failed.$$"
+    rm -rf "$failed"
+    [ ! -e "$USERSPACE" ] || mv "$USERSPACE" "$failed" || return 1
+    if ! mv "$USERSPACE.old" "$USERSPACE"; then
+      [ ! -e "$failed" ] || mv "$failed" "$USERSPACE"
+      return 1
+    fi
+    say "failed userspace candidate preserved at $failed"
+  elif [ "$prior_had" = 0 ]; then
+    if [ -e "$USERSPACE" ]; then
+      failed="$USERSPACE.failed.$$"
+      rm -rf "$failed"
+      mv "$USERSPACE" "$failed" || return 1
+      say "failed userspace candidate preserved at $failed"
+    fi
+  elif [ ! -f "$USERSPACE/cuda/libcuda.so.1" ]; then
+    return 1
+  fi
+  [ ! -f "$LDCONF" ] || ldconfig
+}
+
+restore_activation_snapshot() {
+  local prior_mode=$1 prior_had=$2
+  restore_userspace_snapshot "$prior_had" || return 1
+  case "$prior_mode" in
+    seamless) (cmd_seamless on) || return 1 ;;
+    shell|core)
+      if [ -f "$LDCONF" ] || is_sidecar_smi; then
+        (cmd_seamless off) || return 1
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_setup() {
+  local mode=shell driver="" ids="" yes=0 plan=0 allow_untested=0 allow_secure_boot=0 arg loaded old_driver old_ids selected_id
+  local prior_mode prior_had_userspace=0 post_error=""
+  while [ $# -gt 0 ]; do
+    arg=$1; shift
+    case "$arg" in
+      --mode) [ $# -gt 0 ] || die "--mode needs core, shell, or seamless"; mode=$1; shift ;;
+      --driver-version) [ $# -gt 0 ] || die "--driver-version needs a value"; driver=$1; shift ;;
+      --ids) [ $# -gt 0 ] || die "--ids needs a comma-separated value"; ids=$1; shift ;;
+      --allow-untested) allow_untested=1 ;;
+      --allow-secure-boot) allow_secure_boot=1 ;;
+      --yes|-y) yes=1 ;;
+      --plan) plan=1 ;;
+      --help|-h)
+        cat <<'EOF'
+Usage: nvidia-sidecar setup [OPTIONS]
+  --mode core|shell|seamless  Activation profile (default: shell)
+  --driver-version VERSION    Must exactly match the loaded open R580 module
+  --ids ID[,ID...]            Legacy NVIDIA PCI device IDs (default: auto-detect)
+  --plan                      Preflight and print changes without mutating the host
+  --yes                       Confirm non-interactively
+  --allow-untested            Permit an untested OS or a non-V100 legacy GPU family
+  --allow-secure-boot         Permit an unverified Secure Boot/MOK configuration
+EOF
+        return 0 ;;
+      *) die "unknown setup option: $arg" ;;
+    esac
+  done
+  case "$mode" in core|shell|seamless) ;; *) die "--mode must be core, shell, or seamless" ;; esac
+  loaded=$(python3 "$HERE/lib/detect.py" open-version)
+  driver=${driver:-$loaded}
+  valid_version "$driver" || die "setup requires an R580 driver version"
+  [ "$driver" = "$loaded" ] || die "requested driver $driver does not exactly match the loaded open driver $loaded"
+  [ -n "$ids" ] || ids=$(python3 "$HERE/lib/detect.py" legacy-ids | paste -sd,)
+  ids=$(python3 "$HERE/lib/detect.py" normalize-ids "$ids") ||
+    die "no valid legacy GPU IDs were selected"
+  while IFS= read -r selected_id; do
+    python3 "$HERE/lib/detect.py" gpu-ids | grep -qx "$selected_id" ||
+      die "selected PCI device ID $selected_id is not present on this host"
+    python3 "$HERE/lib/detect.py" legacy-ids | tr '[:lower:]' '[:upper:]' | grep -qx "$selected_id" ||
+      die "selected PCI device ID $selected_id is already owned by the primary open driver"
+  done < <(printf '%s\n' "$ids" | tr ',' '\n')
+  while IFS= read -r selected_id; do
+    id_allowed_by_setup_policy "$driver" "$selected_id" "$allow_untested" ||
+      die "PCI device ID $selected_id is not a V100/V100S family device; use --allow-untested for another legacy GPU"
+  done < <(printf '%s\n' "$ids" | tr ',' '\n')
+
+  local doctor_args=(--mode "$mode")
+  [ "$allow_untested" = 0 ] || doctor_args+=(--allow-untested)
+  [ "$allow_secure_boot" = 0 ] || doctor_args+=(--allow-secure-boot)
+  python3 "$HERE/lib/detect.py" report "${doctor_args[@]}" ||
+    die "preflight found blockers; nothing was changed"
+
+  old_driver=$(manifest_field driver_version 2>/dev/null || true)
+  old_ids=$(manifest_field legacy_ids 2>/dev/null || true)
+  if [ -n "$old_ids" ]; then
+    old_ids=$(python3 "$HERE/lib/detect.py" normalize-ids "$old_ids") ||
+      die "the existing installation records invalid GPU IDs: $old_ids"
+  fi
+  [ -z "$old_driver" ] || [ "$old_driver" = "$driver" ] ||
+    die "an installation for driver $old_driver exists; uninstall it before changing driver versions"
+  [ -z "$old_ids" ] || [ "$old_ids" = "$ids" ] ||
+    die "an installation for GPU IDs $old_ids exists; uninstall it before changing the claimed GPUs"
+
+  cat <<EOF
+nvidia-sidecar $SIDECAR_RELEASE installation plan
+  open/proprietary driver: $driver (exact version match)
+  sidecar PCI device IDs:  $ids
+  activation mode:         $mode
+  persistent changes:      DKMS package, two systemd units, one modprobe file,
+                           $INSTALL_ROOT and $CLI_LINK
+EOF
+  case "$mode" in
+    core) echo "  CUDA visibility:          legacy GPUs only through 'nvidia-sidecar run'" ;;
+    shell) echo "  CUDA visibility:          merged only after 'eval \"\$(nvidia-sidecar env)\"'" ;;
+    seamless) echo "  CUDA visibility:          system-wide merged libcuda/NVML and nvidia-smi" ;;
+  esac
+  cat <<'EOF'
+  hardware truth:           the legacy GPU keeps its native compute capability;
+                           CUDA 13 cannot compile or provide libraries for Maxwell/Pascal/Volta,
+                           so legacy-targeted workload code must come from CUDA 12.x builds.
+EOF
+  [ "$plan" = 0 ] || return 0
+  need_root
+  if [ "$yes" = 0 ]; then
+    [ -t 0 ] || die "non-interactive setup requires --yes"
+    printf 'Continue with these exact changes? [y/N] '
+    read -r arg
+    [[ "$arg" =~ ^[Yy]([Ee][Ss])?$ ]] || die "cancelled; nothing was changed"
+  fi
+
+  mkdir -p "$STATE"
+  exec 9>"$STATE/setup.lock"
+  flock -n 9 || die "another nvidia-sidecar setup/uninstall is running"
+  if [ "$(version_of_source 2>/dev/null || true)" = "$driver" ] &&
+     [ -f "$STATE/extract/kernel/nvidia/nv-kernel.o_binary" ] &&
+     [ -f "$STATE/extract/supported-gpus/supported-gpus.json" ]; then
+    say "reusing the verified NVIDIA $driver extraction"
+  else
+    cmd_fetch "$driver"
+  fi
+  cmd_patch --ids "$ids"
+  prior_mode=$(actual_activation_mode) ||
+    die "the current seamless loader/nvidia-smi state is inconsistent; repair it before setup"
+  [ ! -f "$USERSPACE/cuda/libcuda.so.1" ] || prior_had_userspace=1
+  NVIDIA_SIDECAR_PRIOR_MODE=$prior_mode
+  cmd_install
+  unset NVIDIA_SIDECAR_PRIOR_MODE
+  systemctl restart nvidia-sidecar.service ||
+    die "the core installed but failed to start; inspect journalctl -u nvidia-sidecar"
+  case "$mode" in
+    core)
+      if [ -f "$LDCONF" ] && ! (cmd_seamless off); then
+        post_error="could not disable seamless mode"
+      fi ;;
+    shell)
+      if ! (cmd_userspace); then
+        post_error="userspace proxy build/install failed"
+      elif [ -f "$LDCONF" ] && ! (cmd_seamless off); then
+        post_error="could not switch from seamless to per-shell mode"
+      fi ;;
+    seamless)
+      if ! (cmd_userspace); then
+        post_error="userspace proxy build/install failed"
+      elif ! (cmd_seamless on); then
+        post_error="could not enable seamless mode"
+      fi ;;
+  esac
+  if [ -z "$post_error" ] && ! (cmd_verify); then
+    post_error="fresh-process verification failed"
+  fi
+  if [ -z "$post_error" ] && ! python3 - "$INSTALL_MANIFEST" "$mode" <<'PY'
+import json, sys
+path, mode = sys.argv[1:]
+data = json.load(open(path))
+data["activation_mode"] = mode
+with open(path + ".new", "w") as out:
+    json.dump(data, out, indent=2)
+    out.write("\n")
+PY
+  then
+    post_error="could not update $INSTALL_MANIFEST"
+  fi
+  if [ -z "$post_error" ] && ! mv "$INSTALL_MANIFEST.new" "$INSTALL_MANIFEST"; then
+    post_error="could not activate $INSTALL_MANIFEST"
+  fi
+  if [ -n "$post_error" ]; then
+    rm -f "$INSTALL_MANIFEST.new"
+    if restore_activation_snapshot "$prior_mode" "$prior_had_userspace"; then
+      die "$post_error; the prior $prior_mode activation was restored"
+    fi
+    die "$post_error; activation rollback was incomplete (inspect $USERSPACE and $LDCONF)"
+  fi
+  say "setup complete ($mode mode)"
+  [ "$mode" != shell ] || say "activate merged CUDA in a shell with: eval \"\$(nvidia-sidecar env)\""
+}
+
+cmd_status() {
+  echo "release: $SIDECAR_RELEASE   suffix: $SUFFIX   source: $(version_of_source || true)   legacy ids: $(cat "$STATE/ids" 2>/dev/null)"
+  echo "profile: $(manifest_field activation_mode 2>/dev/null || echo manual)   manifest: $([ -f "$INSTALL_MANIFEST" ] && echo present || echo absent)"
+  echo "modules: $(lsmod | awk -v n="$MOD" 'index($1,n)==1{print $1}' | paste -sd' ')"
+  echo "legacy GPUs on $MOD: $(minors | wc -l)   device files: $(ls "$NODES" 2>/dev/null | paste -sd' ')"
+  echo "boot service: $(systemctl is-enabled nvidia-sidecar.service 2>/dev/null)   persistence: $(systemctl is-active nvidia-sidecar-persistenced.service 2>/dev/null)"
+  echo "userspace: $([ -f "$USERSPACE/cuda/libcuda.so.1" ] && echo installed || echo "not installed")"
+  cmd_seamless status | sed 's/^/  /'
+  command -v dkms >/dev/null && dkms status -m "nvidia-$SUFFIX" 2>/dev/null
+}
+
+cmd_version() { echo "nvidia-sidecar $SIDECAR_RELEASE"; }
+
+cmd_uninstall() {
+  need_root
+  local v package src target
+  mkdir -p "$STATE"
+  exec 9>"$STATE/setup.lock"
+  flock -n 9 || die "another nvidia-sidecar setup/uninstall is running"
+  v=$(version_of_source) || die "cannot uninstall safely: $STATE/version is missing or invalid"
+  package=nvidia-$SUFFIX
+  src=$SOURCE_ROOT/$package-$v
+
+  if ! path_exists "$INSTALL_ROOT" && ! path_exists "$CLI_LINK" &&
+     ! path_exists "$MODPROBE_CONF" && ! path_exists "$BOOT_SERVICE" &&
+     ! path_exists "$PERSIST_SERVICE" && ! path_exists "$LDCONF" &&
+     ! path_exists "$SMI_BACKUP" && ! is_sidecar_smi &&
+     [ ! -d "/sys/module/$MOD" ] &&
+     [ ! -d "/sys/module/${MOD}_uvm" ] &&
+     ! dkms status -m "$package" -v "$v" 2>/dev/null | grep -q .; then
+    say "already uninstalled (kept: $CONF and $STATE)"
+    return 0
+  fi
+  if path_exists "$INSTALL_ROOT" && ! owned_install_root; then
+    die "refusing to remove unrecognized $INSTALL_ROOT"
+  fi
+  for target in "$MODPROBE_CONF" "$BOOT_SERVICE" "$PERSIST_SERVICE" "$CLI_LINK"; do
+    path_exists "$target" && ! owned_system_target "$target" &&
+      die "refusing to remove unrecognized $target"
+  done
+  if path_exists "$src" && [ ! -f "$src/.nvidia-sidecar-patched" ]; then
+    die "refusing to remove unrecognized source tree $src"
+  fi
+
+  if [ -f "$LDCONF" ] || is_sidecar_smi ||
+     path_exists "$SMI_BACKUP"; then
+    cmd_seamless off
+  fi
+  if systemctl is-active nvidia-sidecar.service >/dev/null 2>&1; then
+    systemctl stop nvidia-sidecar.service ||
+      die "could not stop nvidia-sidecar.service; no installation files were removed"
+  elif [ -d "/sys/module/$MOD" ] || [ -d "/sys/module/${MOD}_uvm" ]; then
+    cmd_down
+  fi
+  systemctl disable nvidia-sidecar.service >/dev/null 2>&1 ||
+    [ "$(systemctl is-enabled nvidia-sidecar.service 2>/dev/null)" = disabled ] ||
+    die "could not disable nvidia-sidecar.service"
+
+  if command -v dkms >/dev/null && dkms status -m "$package" -v "$v" | grep -q .; then
+    dkms remove -m "$package" -v "$v" --all ||
+      die "DKMS removal failed; system files were kept for recovery"
+  fi
+  rm -f "$BOOT_SERVICE" "$PERSIST_SERVICE" "$MODPROBE_CONF" "$CLI_LINK" ||
+    die "DKMS was removed, but one or more managed system files could not be removed"
+  rm -rf "$MODULES_ROOT/$(uname -r)/updates/nvidia-$SUFFIX" ||
+    die "could not remove the non-DKMS fallback module directory"
+  [ ! -e "$src" ] || rm -rf "$src" || die "could not remove $src"
+  [ ! -e "$INSTALL_ROOT" ] || rm -rf "$INSTALL_ROOT" || die "could not remove $INSTALL_ROOT"
+  rm -f "$INSTALL_MANIFEST" "$INSTALL_MANIFEST.new" || die "could not remove $INSTALL_MANIFEST"
+  depmod -a || die "files were removed, but depmod failed"
+  systemctl daemon-reload || die "files were removed, but systemd daemon-reload failed"
+  say "uninstalled (kept: $CONF and $STATE)"
+}
+
+if [ "${NVIDIA_SIDECAR_LIB_ONLY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+case "${1:-}" in
+  doctor|setup|fetch|patch|install|up|down|run|bindpaths|userspace|seamless|env|status|version|verify|uninstall) c=$1; shift; "cmd_$c" "$@" ;;
+  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

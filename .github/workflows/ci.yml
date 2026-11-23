@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  installer-and-unit-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: bash -n nvidia-sidecar install.sh lib/build_userspace.sh tests/test_installer.sh scripts/build_release.sh
+      - name: Python syntax and unit tests
+        run: |
+          python3 -m py_compile lib/*.py lib/cuda-proxy/*.py lib/nvml-proxy/*.py tests/*.py
+          python3 tests/test_detect.py -v
+          python3 tests/test_nvidia_smi_merged.py -v
+      - name: Installer transaction tests
+        run: tests/test_installer.sh
+      - name: Patch whitespace
+        run: git diff --check

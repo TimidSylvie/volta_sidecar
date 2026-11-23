@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "driver_branch": 580,
+  "supported_device_families": {
+    "tesla_v100_v100s": {
+      "architecture": "Volta GV100",
+      "support": "automatic",
+      "devices": {
+        "1DB1": "Tesla V100 SXM2 16GB",
+        "1DB3": "Tesla V100 FHHL 16GB",
+        "1DB4": "Tesla V100 PCIe 16GB",
+        "1DB5": "Tesla V100 SXM2 32GB",
+        "1DB6": "Tesla V100 PCIe 32GB",
+        "1DB7": "Tesla V100 DGXS 32GB",
+        "1DB8": "Tesla V100 SXM3 32GB",
+        "1DF6": "Tesla V100S PCIe 32GB"
+      }
+    }
+  },
+  "versions": {
+    "580.178.04": {
+      "installer_sha256": "5975a86ee45bffcb626f51ae33d1169b108186a2ea47ad651e72f13fa4b6d6f9",
+      "status": "tested",
+      "physically_tested_ids": [
+        "1DB6"
+      ],
+      "tested_on": [
+        "Ubuntu 24.04, kernel 6.8.0-149, RTX 5060 Ti plus Tesla V100 PCIe 32GB"
+      ]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+[Unit]
+Description=nvidia-sidecar: legacy NVIDIA GPUs on nvidia_@SUFFIX@ beside the open driver
+After=systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nvidia-sidecar up
+ExecStop=/usr/local/sbin/nvidia-sidecar down
+
+[Install]
+WantedBy=multi-user.target
